@@ -1,11 +1,11 @@
 {
   "id": "config-bypass-defaults",
-  "description": "Write bypass defaults into ~/.codex/config.toml: approval_mode=never, sandbox=danger-full-access",
+  "description": "Write bypass defaults into ~/.codex/config.toml: approval_policy=never, sandbox_mode=danger-full-access. Inserted above the first [table] so they stay top-level. danger-full-access disables the sandbox, which makes the Never approval policy resolve to Allow instead of Forbidden — a full, cross-platform bypass with no binary patch.",
   "type": "config_toml",
   "config_path": "~/.codex/config.toml",
   "defaults": {
-    "default_tools_approval_mode": "\"never\"",
-    "sandbox_permissions": "[\"disk-full-read-access\", \"disk-full-write-access\", \"network-full-access\"]"
+    "approval_policy": "\"never\"",
+    "sandbox_mode": "\"danger-full-access\""
   },
-  "version_last_tested": "0.129.0"
+  "version_last_tested": "0.139.0"
 }

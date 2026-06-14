@@ -1,9 +1,18 @@
 # ccp: default bypass configuration for ~/.codex/config.toml
-# Installed by `ccp install-config` — only adds keys not already present.
-# Reference: codex --help  (--ask-for-approval, --sandbox flags)
+# Installed by `ccp install-config` — only adds keys not already present, and
+# inserts them above the first [table] so they stay top-level (valid TOML).
+# Reference: codex --help  (-a/--ask-for-approval, -s/--sandbox).
+#
+# This pair is the supported, cross-platform full bypass:
+#   approval_policy = "never"               -> never prompt for command approval
+#   sandbox_mode    = "danger-full-access"  -> no filesystem/network sandbox
+# danger-full-access counts as "sandbox explicitly disabled", so the Never
+# approval policy resolves to Allow instead of hitting the Forbidden gate
+# ("approval required by policy, but AskForApproval is set to Never").
+# Works identically on macOS, Linux, and Windows with no binary patch.
 
-# Never prompt for tool approval
-default_tools_approval_mode = "never"
+# Never prompt for command approval
+approval_policy = "never"
 
-# Full sandbox access — allow all disk + network operations
-sandbox_permissions = ["disk-full-read-access", "disk-full-write-access", "network-full-access"]
+# No sandbox — full disk + network access for model-run commands
+sandbox_mode = "danger-full-access"

@@ -737,6 +737,33 @@ def backup(target: Path) -> Path:
 
 # ── config/toml patches ───────────────────────────────────────────────────────
 
+def _insert_top_level_toml(existing_text: str, block: str) -> str:
+    """
+    Insert `block` of top-level key/value lines into a config.toml so the keys
+    stay top-level. TOML scopes bare keys to the most recent [table] header, so
+    appending at EOF would silently nest them under the last table. We insert
+    the block immediately before the first [table]/[[array]] header instead, or
+    append at EOF when the file has no tables.
+
+    `block` is the full text to splice in (caller supplies the leading marker
+    comment + newline). Returns the new file text.
+    """
+    lines = existing_text.splitlines()
+    insert_at = None
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("["):
+            insert_at = i
+            break
+    if insert_at is None:
+        # No tables — safe to append at end.
+        return existing_text.rstrip("\n") + "\n\n" + block.strip("\n") + "\n"
+    head = "\n".join(lines[:insert_at]).rstrip("\n")
+    tail = "\n".join(lines[insert_at:]).strip("\n")
+    block = block.strip("\n")
+    segments = [s for s in (head, block, tail) if s]
+    return "\n\n".join(segments) + "\n"
+
+
 def _apply_toml_defaults(p: dict, dry_run: bool = False) -> tuple[bool, str]:
     """
     config_toml patch type: write default keys into ~/.codex/config.toml.
@@ -766,9 +793,9 @@ def _apply_toml_defaults(p: dict, dry_run: bool = False) -> tuple[bool, str]:
     if dry_run:
         return True, f"would add {len(added)} key(s): {', '.join(k.split('=')[0].strip() for k in added)}"
 
-    # Prepend new keys with a comment
-    insert = f"\n# ccp: bypass defaults\n" + "\n".join(added) + "\n"
-    config_path.write_text(existing_text.rstrip("\n") + insert, encoding="utf-8")
+    block = "# ccp: bypass defaults\n" + "\n".join(added) + "\n"
+    new_text = _insert_top_level_toml(existing_text, block)
+    config_path.write_text(new_text, encoding="utf-8")
     return True, f"{len(added)} key(s) added"
 
 
@@ -1511,8 +1538,9 @@ def cmd_install_config(args) -> int:
         print(f"  {G}no-op{X}  all keys already present")
         return 0
 
-    insert = f"\n{MARKER}\n" + "\n".join(added) + "\n"
-    config_path.write_text(existing_text.rstrip("\n") + insert, encoding="utf-8")
+    block = f"{MARKER}\n" + "\n".join(added) + "\n"
+    new_text = _insert_top_level_toml(existing_text, block)
+    config_path.write_text(new_text, encoding="utf-8")
     print(f"  {G}{CHECK}{X} {len(added)} key(s) added to {config_path}")
     print(f"\n{G}{CHECK} config installed{X}")
     return 0
