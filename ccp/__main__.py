@@ -188,7 +188,13 @@ def find_target() -> Path | None:
     if launcher_str:
         try:
             launcher = Path(launcher_str).resolve()
-            candidate_root = launcher.parent.parent / "lib" / "node_modules"
+            # Windows global npm launcher is %APPDATA%\npm\codex.cmd and modules live
+            # in %APPDATA%\npm\node_modules; Unix uses <prefix>/bin/codex -> <prefix>/lib/node_modules.
+            candidate_root = (
+                launcher.parent / "node_modules"
+                if sys.platform == "win32"
+                else launcher.parent.parent / "lib" / "node_modules"
+            )
             if candidate_root.is_dir():
                 codex_pkg = candidate_root / _PKG
                 node_mods = codex_pkg / "node_modules"
@@ -645,16 +651,26 @@ def _classify_instr_sites(raw: bytes, subs: list[dict]) -> list[str]:
         if not (anchor and mbx and rbx):
             states.append("optional" if optional else "miss")
             continue
+        try:
+            expected = bytes.fromhex(mbx)
+            replacement = bytes.fromhex(rbx)
+            marker = bytes.fromhex(amk) if amk else None
+        except ValueError:
+            states.append("optional" if optional else "miss")
+            continue
+        if len(expected) != len(replacement):
+            states.append("optional" if optional else "miss")
+            continue
         ap = find_anchor(raw, anchor)
-        n  = len(mbx) // 2
+        n = len(expected)
         state = "miss"
         if ap is not None:
             off = ap + int(sub.get("offset_from_anchor", 0))
             if 0 <= off and off + n <= len(raw):
                 cur = raw[off:off + n]
-                if amk and cur == bytes.fromhex(amk):
+                if marker is not None and cur == marker:
                     state = "already"
-                elif cur == bytes.fromhex(mbx):
+                elif cur == expected:
                     state = "apply"
         if state == "miss" and optional:
             state = "optional"
@@ -1009,6 +1025,21 @@ def _summarize_toml_changes(changes: list[dict]) -> tuple[list[dict], str]:
     return actionable, ", ".join(parts)
 
 
+def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """Write `text` to `path` atomically via a sibling temp file + os.replace,
+    cleaning up the temp file if the write or replace fails."""
+    tmp = path.parent / f".{path.name}.ccptmp-{os.getpid()}"
+    try:
+        tmp.write_text(text, encoding=encoding)
+        tmp.replace(path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
 def _apply_toml_defaults(p: dict, dry_run: bool = False) -> tuple[bool, str]:
     """
     config_toml patch type: ensure the bypass keys hold the bypass values at
@@ -1031,7 +1062,7 @@ def _apply_toml_defaults(p: dict, dry_run: bool = False) -> tuple[bool, str]:
         return True, msg
     if dry_run:
         return True, f"would set: {msg}"
-    config_path.write_text(new_text, encoding="utf-8")
+    _atomic_write_text(config_path, new_text, encoding="utf-8")
     return True, f"set: {msg}"
 
 
@@ -1966,7 +1997,7 @@ def cmd_install_config(args) -> int:
         print(f"  {G}no-op{X}  bypass already active top-level")
         print(f"\n{G}{CHECK} config installed{X}")
         return 0
-    config_path.write_text(new_text, encoding="utf-8")
+    _atomic_write_text(config_path, new_text, encoding="utf-8")
     print(f"  {G}{CHECK}{X} {msg}  ({config_path})")
     print(f"\n{G}{CHECK} config installed{X}")
     return 0

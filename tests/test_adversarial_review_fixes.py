@@ -237,6 +237,29 @@ def test_resolve_excludes_wrapper(tmp_path, monkeypatch):
     assert m._resolve_real_codex_invocation(exclude=wrapper) is None
 
 
+# ── Kimi round — malformed patch hex must abort cleanly, not crash ──────────
+
+def test_classify_instr_sites_tolerates_bad_hex():
+    from ccp.__main__ import _classify_instr_sites
+    raw = b"\x00" * 64 + b"ANCHOR" + b"\x00" * 64
+    subs = [
+        {"anchor": "ANCHOR", "offset_from_anchor": 0, "match_bytes_hex": "zz", "replace_bytes_hex": "eb45"},
+        {"anchor": "ANCHOR", "offset_from_anchor": 0, "match_bytes_hex": "74", "replace_bytes_hex": "eb45"},  # length mismatch
+    ]
+    # Must not raise; both malformed sites classify as 'miss'.
+    states = _classify_instr_sites(raw, subs)
+    assert states == ["miss", "miss"]
+
+
+def test_atomic_write_text_roundtrip(tmp_path):
+    from ccp.__main__ import _atomic_write_text
+    p = tmp_path / "config.toml"
+    _atomic_write_text(p, 'approval_policy = "never"\n')
+    assert p.read_text(encoding="utf-8") == 'approval_policy = "never"\n'
+    # no leftover temp files
+    assert not list(tmp_path.glob(".config.toml.ccptmp-*"))
+
+
 # ── Round 2 — atomic verdict reporting (Finding 3) ──────────────────────────
 
 def test_instr_verdict_mapping():
