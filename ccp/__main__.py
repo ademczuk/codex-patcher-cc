@@ -1040,17 +1040,27 @@ def _install_windows_wrapper() -> tuple[bool, str, Path | None]:
         return False, "codex binary not found — run 'npm install -g @openai/codex'", None
     dst = Path.home() / ".local" / "bin" / "codex.cmd"
     dst.parent.mkdir(parents=True, exist_ok=True)
+    stale = False
     if dst.exists():
         try:
-            if _WIN_WRAPPER_MARKER in dst.read_text(encoding="utf-8", errors="replace"):
-                return True, f"no-op (already installed at {dst})", dst
+            existing = dst.read_text(encoding="utf-8", errors="replace")
         except Exception:
-            pass
+            existing = ""
+        if _WIN_WRAPPER_MARKER in existing:
+            # Only no-op when the embedded CODEX_REAL still exists AND matches the
+            # current resolved binary. An npm upgrade/reinstall can move or remove
+            # the vendored codex.exe, which would leave the shim calling a dead
+            # path; in that case rewrite instead of falsely reporting success.
+            m = re.search(r'set "CODEX_REAL=(.+?)"', existing)
+            embedded = m.group(1).strip() if m else None
+            if embedded and embedded == real and Path(embedded).exists():
+                return True, f"no-op (already installed at {dst})", dst
+            stale = True  # marker present but target missing/changed — refresh it
     content = _WIN_WRAPPER_TEMPLATE.replace("__CODEX_REAL__", real)
     crlf = content.replace("\r\n", "\n").replace("\n", "\r\n")
     dst.unlink(missing_ok=True)
     dst.write_bytes(crlf.encode("utf-8"))
-    return True, f"installed at {dst}", dst
+    return True, (f"refreshed stale target at {dst}" if stale else f"installed at {dst}"), dst
 
 
 def _apply_wrapper(p: dict, target: Path | None, dry_run: bool = False) -> tuple[bool, str]:

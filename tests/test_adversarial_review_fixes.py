@@ -206,3 +206,29 @@ def test_install_config_repairs_old_marker_install(tmp_path, monkeypatch):
     top = _toml_top_level_text((codex_dir / "config.toml").read_text(encoding="utf-8"))
     assert "approval_policy" in top
     assert "sandbox_mode" in top
+
+
+# ── Round 3 — Windows wrapper refreshes a stale embedded target ─────────────
+
+def test_windows_wrapper_refreshes_stale_target(tmp_path, monkeypatch):
+    import ccp.__main__ as m
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    real = tmp_path / "vendor" / "codex.exe"
+    real.parent.mkdir(parents=True)
+    real.write_bytes(b"\x00" * 16)
+    monkeypatch.setattr(m, "_resolve_real_codex_invocation", lambda: str(real))
+
+    cmd = tmp_path / ".local" / "bin" / "codex.cmd"
+    cmd.parent.mkdir(parents=True)
+    # Marker present, but CODEX_REAL points at a path that no longer exists.
+    cmd.write_text('@echo off\nREM ccp-wrapper\nset "CODEX_REAL=C:\\gone\\codex.exe"\n',
+                   encoding="utf-8")
+
+    ok, msg, dst = m._install_windows_wrapper()
+    assert ok and "refresh" in msg.lower()
+    assert str(real) in dst.read_text(encoding="utf-8")   # rewritten to the live target
+
+    # Now that the embedded target is valid, a second run is a clean no-op.
+    ok2, msg2, _ = m._install_windows_wrapper()
+    assert ok2 and "no-op" in msg2
