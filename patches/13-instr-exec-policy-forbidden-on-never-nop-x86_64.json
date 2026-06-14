@@ -11,7 +11,7 @@
       "match_bytes_hex": "0f8528010000",
       "match_disasm": "jne 0x144fbc37c  (branch to Forbidden error-emit block when discriminant != 3)",
       "replace_bytes_hex": "660f1f440000",
-      "replace_disasm": "nop (6-byte)  — fall through to the allow/continue path",
+      "replace_disasm": "nop (6-byte)  - fall through to the allow/continue path",
       "applied_marker_hex": "660f1f440000",
       "description": "NOP the jne gate so Decision::Forbidden is never taken under AskForApproval::Never (x86_64)"
     }

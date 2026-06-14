@@ -10,6 +10,6 @@
 # Windows, or the bash interpreter line breaks.
 contrib/wrappers/codex text eol=lf
 
-# Binary assets — never normalize.
+# Binary assets - never normalize.
 *.png binary
 *.gz binary
