@@ -1289,13 +1289,45 @@ def cmd_doctor(args) -> int:
                 print(f"  {DOT} skip       : {p.get('id','?')}  (not applicable to fmt={fmt})")
                 continue
             applied = False
-            for sub in p.get("patches", []):
-                marker = sub.get("applied_marker")
-                if marker:
-                    marker_b = marker.encode("utf-8", "surrogateescape")
-                    if any(data.find(marker_b, lo, hi) >= 0 for lo, hi in bounds):
-                        applied = True
-                        break
+            not_here = False
+            if p.get("type") == "instr_replace":
+                # instr patches record application as the replacement bytes at
+                # anchor+offset (applied_marker_hex). If neither the marker nor
+                # the original match bytes are present, the patch does not target
+                # this binary (e.g. an arm64 patch against a PE) — report skip,
+                # not "not applied", so doctor agrees with the dry-run classifier.
+                hit = miss = 0
+                for sub in p.get("patches", []):
+                    anchor = sub.get("anchor", "").encode("utf-8", "surrogateescape")
+                    amk = sub.get("applied_marker_hex")
+                    mbx = sub.get("match_bytes_hex")
+                    ap = data.find(anchor) if anchor else -1
+                    if ap < 0 or not (amk or mbx):
+                        continue
+                    off = ap + int(sub.get("offset_from_anchor", 0))
+                    n = len(amk or mbx) // 2
+                    if off < 0 or off + n > len(data):
+                        continue
+                    cur = bytes(data[off:off + n])
+                    if amk and cur == bytes.fromhex(amk):
+                        hit += 1
+                    elif mbx and cur == bytes.fromhex(mbx):
+                        miss += 1
+                if hit and not miss:
+                    applied = True
+                elif hit == 0 and miss == 0:
+                    not_here = True
+            else:
+                for sub in p.get("patches", []):
+                    marker = sub.get("applied_marker")
+                    if marker:
+                        marker_b = marker.encode("utf-8", "surrogateescape")
+                        if any(data.find(marker_b, lo, hi) >= 0 for lo, hi in bounds):
+                            applied = True
+                            break
+            if not_here:
+                print(f"  {DOT} skip       : {p.get('id','?')}  (anchors not in this binary)")
+                continue
             icon = f"{G}{CHECK}{X}" if applied else f"{Y}{WARN_ICON}{X}"
             print(f"  {icon} patch      : {p.get('id','?')}  ({'applied' if applied else 'not applied'})")
         for p in [x for x in patches if not _is_binary_patch(x)]:
@@ -1316,7 +1348,13 @@ def cmd_doctor(args) -> int:
     if target:
         try:
             text = _scanner.load_text_from_target(target)
-            rows = _scanner.SigScanner(text).scan_patches(_scanner.load_patches_from_dir(PATCH_DIR))
+            # Only score drift for patches that target this binary's format —
+            # a macOS-only seatbelt patch is not "drift" on a Windows PE.
+            _drift_patches = [
+                p for p in _scanner.load_patches_from_dir(PATCH_DIR)
+                if _patch_applies_to_format(p, fmt)
+            ]
+            rows = _scanner.SigScanner(text).scan_patches(_drift_patches)
             drift   = [r["id"] for r in rows if r["status"] == "drift"]
             total_a = len([r for r in rows if r.get("anchors_found", 0) > 0])
             total_d = len([r for r in rows if r.get("anchors_declared", 0) > 0])
@@ -1330,7 +1368,10 @@ def cmd_doctor(args) -> int:
 
     # ── Codex CLI version ─────────────────────────────────────────────────────
     try:
-        r = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=8)
+        # `codex` is codex.cmd on Windows; bare "codex" via subprocess (no shell)
+        # does not resolve there. shutil.which() finds the PATHEXT match.
+        _codex = shutil.which("codex") or "codex"
+        r = subprocess.run([_codex, "--version"], capture_output=True, text=True, timeout=8)
         codex_ver = (r.stdout or r.stderr or "").strip().splitlines()[0] if r.returncode == 0 else None
         if codex_ver:
             print(f"  {G}codex ver  : {codex_ver}{X}")
@@ -1341,8 +1382,15 @@ def cmd_doctor(args) -> int:
 
     # ── wrapper / config / AGENTS.md installed ────────────────────────────────
     codex_dir  = Path.home() / ".codex"
-    wrapper    = Path.home() / ".local" / "bin" / "codex"
-    w_ok = wrapper.exists() and "ccp-wrapper" in (wrapper.read_text(encoding="utf-8", errors="replace") if wrapper.exists() else "")
+    # The wrapper is codex.cmd on Windows, codex (no extension) on POSIX.
+    _wrapper_candidates = [
+        Path.home() / ".local" / "bin" / "codex.cmd",
+        Path.home() / ".local" / "bin" / "codex",
+    ]
+    w_ok = any(
+        w.exists() and "ccp-wrapper" in w.read_text(encoding="utf-8", errors="replace")
+        for w in _wrapper_candidates
+    )
     c_ok = (codex_dir / "config.toml").exists()
     a_ok = (codex_dir / "AGENTS.md").exists()
     print(f"  wrapper    : {G+'installed'+X if w_ok else Y+'not installed — run ccp install-wrapper'+X}")
