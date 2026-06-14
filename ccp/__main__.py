@@ -799,8 +799,76 @@ def _apply_toml_defaults(p: dict, dry_run: bool = False) -> tuple[bool, str]:
     return True, f"{len(added)} key(s) added"
 
 
+# Windows wrapper: a .cmd shim (cmd.exe + PowerShell both execute .cmd, and
+# .CMD is in PATHEXT by default, so typing `codex` runs it). It calls the real
+# vendored codex.exe directly — the npm `codex` launcher is just `node codex.js`
+# that execs this same binary, and ccp already runs it directly for --version.
+# A bash wrapper at ~/.local/bin/codex (no extension) cannot run on Windows and
+# only shadows/breaks the real launcher, so Windows gets this instead.
+_WIN_WRAPPER_TEMPLATE = """@echo off
+REM ccp-wrapper (Windows) — installed by ccp. Prepends
+REM --dangerously-bypass-approvals-and-sandbox to codex, except for meta
+REM subcommands. Calls the real vendored codex.exe directly.
+setlocal
+set "CODEX_REAL=__CODEX_REAL__"
+set "FIRST=%~1"
+if /i "%FIRST%"=="--help"     goto passthrough
+if /i "%FIRST%"=="-h"         goto passthrough
+if /i "%FIRST%"=="--version"  goto passthrough
+if /i "%FIRST%"=="-V"         goto passthrough
+if /i "%FIRST%"=="completion" goto passthrough
+if /i "%FIRST%"=="login"      goto passthrough
+if /i "%FIRST%"=="logout"     goto passthrough
+"%CODEX_REAL%" --dangerously-bypass-approvals-and-sandbox %*
+exit /b %ERRORLEVEL%
+:passthrough
+"%CODEX_REAL%" %*
+exit /b %ERRORLEVEL%
+"""
+
+_WIN_WRAPPER_MARKER = "ccp-wrapper"
+
+
+def _resolve_real_codex_invocation() -> str | None:
+    """Absolute path the Windows wrapper should call. Prefers the vendored
+    codex binary (what ccp already targets/patches); falls back to the npm
+    launcher on PATH."""
+    t = find_target()
+    if t:
+        return str(t)
+    return shutil.which("codex.cmd") or shutil.which("codex")
+
+
+def _install_windows_wrapper() -> tuple[bool, str, Path | None]:
+    """Write ~/.local/bin/codex.cmd that prepends the bypass flag. CRLF line
+    endings (batch). Returns (ok, message, dst)."""
+    real = _resolve_real_codex_invocation()
+    if not real:
+        return False, "codex binary not found — run 'npm install -g @openai/codex'", None
+    dst = Path.home() / ".local" / "bin" / "codex.cmd"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        try:
+            if _WIN_WRAPPER_MARKER in dst.read_text(encoding="utf-8", errors="replace"):
+                return True, f"no-op (already installed at {dst})", dst
+        except Exception:
+            pass
+    content = _WIN_WRAPPER_TEMPLATE.replace("__CODEX_REAL__", real)
+    crlf = content.replace("\r\n", "\n").replace("\n", "\r\n")
+    dst.unlink(missing_ok=True)
+    dst.write_bytes(crlf.encode("utf-8"))
+    return True, f"installed at {dst}", dst
+
+
 def _apply_wrapper(p: dict, target: Path | None, dry_run: bool = False) -> tuple[bool, str]:
     """wrapper patch type: install a shell wrapper script."""
+    # Windows: a .cmd shim, not the bash wrapper (which cannot run there).
+    if sys.platform == "win32":
+        if dry_run:
+            return True, "would install Windows wrapper at ~/.local/bin/codex.cmd"
+        ok, msg, _dst = _install_windows_wrapper()
+        return ok, msg
+
     wrapper_path = Path(p.get("wrapper_path", "~/.local/bin/codex")).expanduser()
     content = p.get("content", "")
     MARKER = p.get("marker", "# ccp-wrapper")
@@ -1472,7 +1540,19 @@ def cmd_install_rules(args) -> int:
 
 
 def cmd_install_wrapper(args) -> int:
-    """Install contrib/wrappers/codex to ~/.local/bin/codex."""
+    """Install the codex wrapper to ~/.local/bin/ (codex.cmd on Windows)."""
+    # Windows: install a .cmd shim that calls the real codex.exe with the
+    # bypass flag. The bash wrapper cannot execute on Windows.
+    if sys.platform == "win32":
+        ok, msg, dst = _install_windows_wrapper()
+        icon = f"{G}{CHECK}{X}" if ok else f"{R}{CROSS}{X}"
+        print(f"  {icon} {msg}")
+        if not ok:
+            return 2
+        print(f"\n{G}{CHECK} wrapper installed{X}")
+        print(r"  Ensure %USERPROFILE%\.local\bin precedes %APPDATA%\npm in PATH")
+        return 0
+
     src_dir = ROOT / "contrib" / "wrappers"
     wrapper_src = src_dir / "codex"
     if not wrapper_src.exists():
