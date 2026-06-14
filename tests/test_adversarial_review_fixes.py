@@ -164,14 +164,77 @@ def test_config_default_added_when_only_nested(tmp_path):
     assert "approval_policy" in msg and "sandbox_mode" in msg
 
 
-def test_config_default_skipped_when_top_level(tmp_path):
+def test_config_default_noop_when_already_bypass(tmp_path):
     cfg = tmp_path / "config.toml"
     cfg.write_text('approval_policy = "never"\n[profiles.work]\nx = 1\n', encoding="utf-8")
     p = {"type": "config_toml", "config_path": str(cfg),
          "defaults": {"approval_policy": '"never"'}}
     ok, msg = _apply_toml_defaults(p, dry_run=True)
     assert ok
-    assert "already applied" in msg
+    assert "no-op" in msg
+
+
+# ── Workflow round — installer must OVERWRITE a conflicting top-level value ──
+
+def test_config_overwrites_conflicting_top_level(tmp_path):
+    # Most real users: a prior Codex run left approval_policy = "on-request".
+    # The installer must set it to the bypass value, not report a false success.
+    from ccp.__main__ import _apply_toml_defaults
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('approval_policy = "on-request"\nsandbox_mode = "workspace-write"\n[profiles.work]\nx = 1\n',
+                   encoding="utf-8")
+    p = {"type": "config_toml", "config_path": str(cfg),
+         "defaults": {"approval_policy": '"never"', "sandbox_mode": '"danger-full-access"'}}
+    ok, msg = _apply_toml_defaults(p, dry_run=False)
+    assert ok
+    import tomllib
+    d = tomllib.load(open(cfg, "rb"))
+    assert d["approval_policy"] == "never"             # overwritten, bypass active
+    assert d["sandbox_mode"] == "danger-full-access"
+    assert d["profiles"]["work"]["x"] == 1             # nested table untouched
+
+
+def test_set_top_level_toml_leaves_nested_alone(tmp_path):
+    from ccp.__main__ import _set_top_level_toml
+    text = 'approval_policy = "on-request"\n[profiles.work]\napproval_policy = "untrusted"\n'
+    new, changes = _set_top_level_toml(text, {"approval_policy": '"never"'})
+    import tomllib
+    d = tomllib.loads(new)
+    assert d["approval_policy"] == "never"                       # top-level changed
+    assert d["profiles"]["work"]["approval_policy"] == "untrusted"  # nested untouched
+    assert any(c["action"] == "changed" for c in changes)
+
+
+# ── Workflow round — shipped x86_64 patch opcode semantics (coverage) ───────
+
+def test_shipped_x86_64_patch_opcodes():
+    import json, glob, os
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for f in glob.glob(os.path.join(repo, "patches", "*x86_64.json")):
+        obj = json.load(open(f))
+        for sub in obj["patches"]:
+            mb = bytes.fromhex(sub["match_bytes_hex"])
+            rb = bytes.fromhex(sub["replace_bytes_hex"])
+            assert len(mb) == len(rb), f"{f}: length not preserved"
+            if len(mb) == 2:  # je rel8 -> jmp rel8, displacement preserved
+                assert mb[0] == 0x74 and rb[0] == 0xEB, f"{f}: not je->jmp"
+                assert mb[1] == rb[1], f"{f}: displacement byte changed"
+            elif len(mb) == 6:  # jne rel32 -> 6-byte NOP
+                assert mb[:2] == b"\x0f\x85", f"{f}: not jne rel32"
+                assert rb == bytes.fromhex("660f1f440000"), f"{f}: not canonical 6-byte NOP"
+
+
+# ── Workflow round — wrapper never resolves to itself (recursion guard) ─────
+
+def test_resolve_excludes_wrapper(tmp_path, monkeypatch):
+    import ccp.__main__ as m
+    wrapper = tmp_path / ".local" / "bin" / "codex.cmd"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("@echo off\nREM ccp-wrapper\n", encoding="utf-8")
+    monkeypatch.setattr(m, "find_target", lambda: None)         # force the PATH fallback
+    monkeypatch.setattr(m.shutil, "which", lambda n: str(wrapper))  # PATH only has the wrapper
+    # With the wrapper excluded, resolution must NOT return the wrapper.
+    assert m._resolve_real_codex_invocation(exclude=wrapper) is None
 
 
 # ── Round 2 — atomic verdict reporting (Finding 3) ──────────────────────────
@@ -217,7 +280,7 @@ def test_windows_wrapper_refreshes_stale_target(tmp_path, monkeypatch):
     real = tmp_path / "vendor" / "codex.exe"
     real.parent.mkdir(parents=True)
     real.write_bytes(b"\x00" * 16)
-    monkeypatch.setattr(m, "_resolve_real_codex_invocation", lambda: str(real))
+    monkeypatch.setattr(m, "_resolve_real_codex_invocation", lambda exclude=None: str(real))
 
     cmd = tmp_path / ".local" / "bin" / "codex.cmd"
     cmd.parent.mkdir(parents=True)

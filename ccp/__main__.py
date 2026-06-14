@@ -872,8 +872,10 @@ def patch_binary_inplace(binary: Path, patches: list[dict]) -> dict:
                     "per_patch": per_patch,
                 }
 
-        binary.unlink()
-        tmp_bin.rename(binary)
+        # Atomic overwrite-rename: no window where the directory has no codex
+        # binary (the old unlink()+rename() left a microsecond gap on a hard kill).
+        # os.replace overwrites the destination on Windows too, unlike Path.rename.
+        os.replace(tmp_bin, binary)
         binary.chmod(mode)
         # Re-sign the installed binary (Mach-O only)
         if fmt == "macho":
@@ -945,11 +947,73 @@ def _insert_top_level_toml(existing_text: str, block: str) -> str:
     return "\n\n".join(segments) + "\n"
 
 
+def _set_top_level_toml(existing_text: str, kvs: dict, marker: str = "# ccp: bypass defaults") -> tuple[str, list[dict]]:
+    """
+    Ensure each key in `kvs` is set to the given (TOML-literal) value at TOP
+    LEVEL — before the first [table]. Replaces a conflicting top-level value,
+    inserts a missing key, leaves an already-correct key alone, and never
+    touches a same-named key nested under a [table].
+
+    This is the load-bearing installer primitive: the bypass requires the keys
+    to actually hold the bypass values, so we OVERWRITE a conflicting top-level
+    value (e.g. an existing approval_policy = "on-request") rather than silently
+    skip it and report a false success.
+
+    Returns (new_text, changes) where each change is
+    {key, action: 'added'|'changed'|'unchanged', new, old?}.
+    """
+    lines = existing_text.splitlines()
+    first_tbl = next((i for i, l in enumerate(lines) if l.lstrip().startswith("[")), len(lines))
+    changes: list[dict] = []
+    missing: list[tuple[str, str]] = []
+    for key, val in kvs.items():
+        val = str(val)
+        rgx = re.compile(r"^\s*" + re.escape(key) + r"\s*=\s*(.*?)\s*$")
+        hit = None
+        old = None
+        for i in range(first_tbl):
+            m = rgx.match(lines[i])
+            if m:
+                hit, old = i, m.group(1)
+                break
+        if hit is None:
+            missing.append((key, val))
+            changes.append({"key": key, "action": "added", "new": val})
+        elif old != val:
+            lines[hit] = f"{key} = {val}"
+            changes.append({"key": key, "action": "changed", "old": old, "new": val})
+        else:
+            changes.append({"key": key, "action": "unchanged", "new": val})
+
+    text = "\n".join(lines)
+    if existing_text.endswith("\n") and not text.endswith("\n"):
+        text += "\n"
+    if missing:
+        head = f"{marker}\n" if (marker and marker not in text) else ""
+        block = head + "\n".join(f"{k} = {v}" for k, v in missing) + "\n"
+        text = _insert_top_level_toml(text, block)
+    return text, changes
+
+
+def _summarize_toml_changes(changes: list[dict]) -> tuple[list[dict], str]:
+    """Return (actionable_changes, human_message). Actionable = added or changed."""
+    actionable = [c for c in changes if c["action"] in ("added", "changed")]
+    if not actionable:
+        return [], "no-op (bypass already active top-level)"
+    parts = []
+    for c in actionable:
+        if c["action"] == "changed":
+            parts.append(f"{c['key']} {c['old']}->{c['new']}")
+        else:
+            parts.append(f"+{c['key']}")
+    return actionable, ", ".join(parts)
+
+
 def _apply_toml_defaults(p: dict, dry_run: bool = False) -> tuple[bool, str]:
     """
-    config_toml patch type: write default keys into ~/.codex/config.toml.
-    Only sets keys that are absent — never overwrites operator-set values.
-    Uses simple line-based TOML writer (no external deps).
+    config_toml patch type: ensure the bypass keys hold the bypass values at
+    TOP LEVEL in ~/.codex/config.toml. Overwrites a conflicting top-level value
+    (the bypass must win), inserts missing keys, ignores nested same-named keys.
     """
     config_path = Path(p.get("config_path", "~/.codex/config.toml")).expanduser()
     defaults: dict[str, str] = p.get("defaults", {})
@@ -961,26 +1025,14 @@ def _apply_toml_defaults(p: dict, dry_run: bool = False) -> tuple[bool, str]:
     if config_path.is_file():
         existing_text = config_path.read_text(encoding="utf-8")
 
-    top_level = _toml_top_level_text(existing_text)
-    added = []
-    for key, val in defaults.items():
-        # Present only when set TOP-LEVEL. A same-named key nested under a
-        # [table] (e.g. approval_policy under [profiles.work]) does not satisfy a
-        # top-level default, so scan only the pre-table prefix.
-        pattern = re.compile(r"^\s*" + re.escape(key) + r"\s*=", re.MULTILINE)
-        if pattern.search(top_level):
-            continue
-        added.append(f'{key} = {val}')
-
-    if not added:
-        return True, "no-op (already applied)"
+    new_text, changes = _set_top_level_toml(existing_text, defaults)
+    actionable, msg = _summarize_toml_changes(changes)
+    if not actionable:
+        return True, msg
     if dry_run:
-        return True, f"would add {len(added)} key(s): {', '.join(k.split('=')[0].strip() for k in added)}"
-
-    block = "# ccp: bypass defaults\n" + "\n".join(added) + "\n"
-    new_text = _insert_top_level_toml(existing_text, block)
+        return True, f"would set: {msg}"
     config_path.write_text(new_text, encoding="utf-8")
-    return True, f"{len(added)} key(s) added"
+    return True, f"set: {msg}"
 
 
 # Windows wrapper: a .cmd shim (cmd.exe + PowerShell both execute .cmd, and
@@ -1022,24 +1074,53 @@ exit /b %ERRORLEVEL%
 _WIN_WRAPPER_MARKER = "ccp-wrapper"
 
 
-def _resolve_real_codex_invocation() -> str | None:
-    """Absolute path the Windows wrapper should call. Prefers the vendored
-    codex binary (what ccp already targets/patches); falls back to the npm
-    launcher on PATH."""
+def _resolve_real_codex_invocation(exclude: Path | None = None) -> str | None:
+    """Absolute path the Windows wrapper should call. Prefers the vendored codex
+    binary (what ccp targets/patches); falls back to the npm launcher on PATH.
+
+    Never returns `exclude` (the wrapper's own path): the install instructions
+    put ~/.local/bin first on PATH, so a bare shutil.which("codex.cmd") would
+    resolve to the wrapper itself and the shim would call itself forever.
+    """
     t = find_target()
     if t:
         return str(t)
-    return shutil.which("codex.cmd") or shutil.which("codex")
+    excl = None
+    if exclude is not None:
+        try:
+            excl = exclude.resolve()
+        except Exception:
+            excl = exclude
+    for name in ("codex.cmd", "codex"):
+        w = shutil.which(name)
+        if not w:
+            continue
+        try:
+            wp = Path(w).resolve()
+        except Exception:
+            wp = Path(w)
+        if excl is not None and wp == excl:
+            continue  # the wrapper itself — keep looking, never self-reference
+        return str(wp)
+    return None
 
 
 def _install_windows_wrapper() -> tuple[bool, str, Path | None]:
     """Write ~/.local/bin/codex.cmd that prepends the bypass flag. CRLF line
     endings (batch). Returns (ok, message, dst)."""
-    real = _resolve_real_codex_invocation()
-    if not real:
-        return False, "codex binary not found — run 'npm install -g @openai/codex'", None
     dst = Path.home() / ".local" / "bin" / "codex.cmd"
     dst.parent.mkdir(parents=True, exist_ok=True)
+    # Resolve the real codex EXCLUDING this wrapper, so CODEX_REAL can never point
+    # back at the shim (infinite recursion when ~/.local/bin is first on PATH).
+    real = _resolve_real_codex_invocation(exclude=dst)
+    if not real:
+        return False, ("could not resolve the real codex binary (only the wrapper is "
+                       "on PATH, or npm codex is missing) — run 'npm install -g @openai/codex'"), None
+    try:
+        if Path(real).resolve() == dst.resolve():
+            return False, "refusing to write a self-referential wrapper (CODEX_REAL == wrapper)", None
+    except Exception:
+        pass
     stale = False
     if dst.exists():
         try:
@@ -1340,8 +1421,21 @@ def cmd_rollback(args) -> int:
         return 1
     latest = baks[-1]
     mode   = target.stat().st_mode & 0o7777
-    target.unlink()
-    shutil.copy2(latest, target)
+    # Atomic restore: stage the backup to a sibling tmp, then os.replace over the
+    # target in one step. Avoids the unlink()+copy window that left no binary on a
+    # hard kill, and the separate unlink() that fails outright when codex.exe is
+    # locked by a running process.
+    tmp = target.parent / f".{target.name}.ccprollback-{os.getpid()}"
+    try:
+        shutil.copy2(latest, tmp)
+        os.replace(tmp, target)
+    except Exception as e:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        print(f"{R}rollback failed: {e}{X}")
+        return 1
     target.chmod(mode)
     if sys.platform == "darwin":
         ok_s, s_msg = codesign(target)
@@ -1770,17 +1864,15 @@ def cmd_install_rules(args) -> int:
         print(f"  {G}{CHECK}{X} AGENTS.md {ARROW} {agents_dst}")
         installed.append("AGENTS.md")
 
-    # ── config.toml — create with bypass defaults if absent (or --force) ──────
-    config_path = codex_dir / "config.toml"
-    config_src  = src_dir / "codex-config.toml"
-    if config_path.exists() and not force:
-        print(f"  {Y}{WARN_ICON}{X}  config.toml already exists — skipping (use --force to overwrite)")
-        skipped.append("config.toml")
-    elif config_src.exists():
-        # delegate to install-config logic
+    # ── config.toml — always ensure the bypass keys hold the bypass values ────
+    # install-config is corrective and idempotent now (it no-ops when the bypass
+    # is already active top-level and overwrites a conflicting value otherwise),
+    # so run it unconditionally. Skipping when config.toml merely "exists" was the
+    # path that left most real users with the bypass inactive but reported OK.
+    config_src = src_dir / "codex-config.toml"
+    if config_src.exists():
         class _ICA:
             pass
-        _saved = config_path
         rc = cmd_install_config(_ICA())
         if rc == 0:
             installed.append("config.toml")
@@ -1852,40 +1944,30 @@ def cmd_install_config(args) -> int:
         existing_text = config_path.read_text(encoding="utf-8")
 
     template = src.read_text(encoding="utf-8")
-    added: list[str] = []
-    MARKER = "# ccp: bypass defaults"
-
-    # Do NOT short-circuit on the marker alone. An old or broken install can carry
-    # the marker while its keys are obsolete or nested under a [table], leaving the
-    # bypass inactive with no repair path. Decide purely on whether each required
-    # key is present TOP-LEVEL; a nested same-named key does not count.
-    top_level = _toml_top_level_text(existing_text)
-    # Parse key=value lines from template, skip section headers and comments
+    # Parse key = value lines from the template (skip comments/section headers).
+    kvs: dict[str, str] = {}
     for line in template.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or stripped.startswith("["):
             continue
         if "=" not in stripped:
             continue
-        key = stripped.split("=", 1)[0].strip()
-        pattern = re.compile(r"^\s*" + re.escape(key) + r"\s*=", re.MULTILINE)
-        if pattern.search(top_level):
-            continue  # operator already set this top-level
-        added.append(line)
+        key, val = stripped.split("=", 1)
+        kvs[key.strip()] = val.strip()
 
-    if not added:
-        print(f"  {G}no-op{X}  all keys already present")
+    # Ensure the bypass keys actually HOLD the bypass values top-level. This
+    # overwrites a conflicting top-level value (e.g. a pre-existing
+    # approval_policy = "on-request" from prior Codex use) instead of reporting a
+    # false success, repairs old/nested installs, and ignores nested same-named
+    # keys.
+    new_text, changes = _set_top_level_toml(existing_text, kvs)
+    actionable, msg = _summarize_toml_changes(changes)
+    if not actionable:
+        print(f"  {G}no-op{X}  bypass already active top-level")
+        print(f"\n{G}{CHECK} config installed{X}")
         return 0
-
-    # Only emit the marker comment if the file does not already carry one (an old
-    # install being repaired keeps its existing marker; we just add the missing
-    # top-level keys).
-    marker_line = "" if MARKER in existing_text else f"{MARKER}\n"
-    block = marker_line + "\n".join(added) + "\n"
-    new_text = _insert_top_level_toml(existing_text, block)
     config_path.write_text(new_text, encoding="utf-8")
-    note = " (repaired existing install)" if MARKER in existing_text else ""
-    print(f"  {G}{CHECK}{X} {len(added)} key(s) added to {config_path}{note}")
+    print(f"  {G}{CHECK}{X} {msg}  ({config_path})")
     print(f"\n{G}{CHECK} config installed{X}")
     return 0
 
@@ -2033,7 +2115,7 @@ def main() -> int:
     p_ir = sub.add_parser("install-rules",
         help="Deploy operator-authorization rules to ~/.codex/ (AUTHORIZATION.md, AGENTS.md, config.toml)")
     p_ir.add_argument("--force", "-f", action="store_true",
-        help="Overwrite existing config.toml and refresh AGENTS.md block")
+        help="Refresh the AGENTS.md authorization block (config.toml bypass keys are always ensured)")
     sub.add_parser("install-wrapper",
         help="Install bypass wrapper to ~/.local/bin/codex")
     sub.add_parser("install-config",
