@@ -68,22 +68,27 @@ Length-preserving (space-pad if shorter, reject if longer). macOS Mach-O: ad-hoc
 
 ## Compatibility Matrix
 
-CCP version 0.129.0 has been validated against all six platform vendor binaries shipped with `@openai/codex@0.129.0`.
+CCP was validated against the macOS/Linux vendor binaries on `@openai/codex@0.129.0`; the Windows column was end-to-end tested on `codex-win32-x64` at `@openai/codex@0.139.0`.
 
-| Platform binary | Format | Wrapper | Config | refusal-strings | seatbelt-allow-default |
-|---|---|---|---|---|---|
-| `codex-darwin-arm64` | Mach-O arm64 | ✓ | ✓ | ✓ scan-ok | ✓ tested (real gate flip) |
-| `codex-darwin-x64`   | Mach-O x86_64 | ✓ | ✓ | ✓ scan-ok | ✓ tested (real gate flip) |
-| `codex-linux-x64`    | ELF x86_64 (musl) | ✓ | ✓ | ✓ scan-ok | ⚠ no equivalent (bubblewrap/landlock are binary structures, not text) |
-| `codex-linux-arm64`  | ELF aarch64 (musl) | ✓ | ✓ | ✓ scan-ok | ⚠ no equivalent |
-| `codex-win32-x64`    | PE32+ x86_64 | ✓ (PS1) | ✓ | ✓ scan-ok | ⚠ no equivalent (restricted-token model uses Win32 APIs, not embedded text) |
-| `codex-win32-arm64`  | PE32+ aarch64 | ✓ (PS1) | ✓ | ✓ scan-ok | ⚠ no equivalent |
+| Platform binary | Format | Wrapper | Config | refusal-strings | seatbelt-allow-default | exec/net gates |
+|---|---|---|---|---|---|---|
+| `codex-darwin-arm64` | Mach-O arm64 | ✓ | ✓ | ✓ scan-ok | ✓ tested (real gate flip) | ✓ arm64 (Gate 12/20) |
+| `codex-darwin-x64`   | Mach-O x86_64 | ✓ | ✓ | ✓ scan-ok | ✓ tested (real gate flip) | ✓ x86_64 (Gate 12/20) |
+| `codex-linux-x64`    | ELF x86_64 (musl) | ✓ | ✓ | ✓ scan-ok | ⚠ no equivalent (bubblewrap/landlock are binary structures, not text) | ✓ x86_64 (Gate 12/20) |
+| `codex-linux-arm64`  | ELF aarch64 (musl) | ✓ | ✓ | ✓ scan-ok | ⚠ no equivalent | ✓ arm64 (Gate 12/20) |
+| `codex-win32-x64`    | PE32+ x86_64 | ✓ (.cmd, tested) | ✓ (tested) | ✓ scan-ok | ⚠ no equivalent (restricted-token model uses Win32 APIs, not embedded text) | ✓ x86_64 (Gate 12/20, tested 0.139.0) |
+| `codex-win32-arm64`  | PE32+ aarch64 | ✓ (.cmd) | ✓ | ✓ scan-ok | ⚠ no equivalent | ✓ arm64 (Gate 12/20, byte-match-gated) |
 
-`scan-ok` = anchor strings resolve under `ccp scan -t <vendor-binary>`. The seatbelt patch is a real runtime-gate flip; the `rust-refusal-strings` patch is cosmetic (softens TUI log messages, does not alter runtime behavior).
+`scan-ok` = anchor strings resolve under `ccp scan -t <vendor-binary>`. The seatbelt and exec/net-gate patches are real runtime-gate flips; the `rust-refusal-strings` patch is cosmetic (softens TUI log messages, does not alter runtime behavior). On every platform the supported full bypass is config-only: `approval_policy = "never"` + `sandbox_mode = "danger-full-access"` (danger-full-access counts as sandbox-disabled, so Never resolves to Allow). The instruction gates matter when a sandbox is still in force.
 
 Patch types:
 - `macho_replace` — Mach-O only (legacy darwin binaries)
 - `binary_replace` — format-agnostic; auto-detects Mach-O / ELF / PE and patches the format's string-constant sections (`__TEXT.__cstring/__const` / `.rodata/.data.rel.ro/.data` / `.rdata/.data`)
+- `instr_replace` - arch-specific instruction patches. arm64 and x86_64 variants ship side by side; the `match_bytes_hex` guard means each applies only to the matching arch and self-skips on the other.
+
+### Windows
+
+On Windows, `codex` is `node codex.js` launching the vendored `codex.exe`, and `find_target` resolves it under `%APPDATA%\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\<triple>\bin\codex.exe`. The wrapper is a `.cmd` shim at `%USERPROFILE%\.local\bin\codex.cmd` (the bash wrapper cannot run on Windows); ensure that directory precedes `%APPDATA%\npm` in `PATH`. No `codesign` step is needed (PE is not signed by ccp). Install with `install.ps1` or `python -m ccp patch`.
 
 ---
 

@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased] - Windows support
+
+End-to-end tested on `codex-win32-x64` at `@openai/codex@0.139.0`.
+
+- **Binary discovery**: `find_target` resolves the Windows vendor layout. npm ships the binary at `vendor/<triple>/bin/codex.exe`, not `vendor/<triple>/codex/codex.exe`. Added the `bin/` layout for every triple, a glob fallback over the vendor tree, and Windows-aware npm root resolution (`npm.cmd` + `%APPDATA%\npm\node_modules`). Previously reported `target NOT FOUND` on Windows.
+- **Config keys corrected**: the installer wrote `default_tools_approval_mode` / `sandbox_permissions`, which are not the top-level switches. Now writes `approval_policy = "never"` + `sandbox_mode = "danger-full-access"` (per `codex --help`). danger-full-access is sandbox-disabled, so Never resolves to Allow, a full bypass with no binary patch on every platform.
+- **Config insertion is table-safe**: keys were appended at EOF, so on any config with `[tables]` TOML scoped them under the last table and they had no effect. New `_insert_top_level_toml` splices them above the first table header.
+- **Windows wrapper**: a `.cmd` shim at `%USERPROFILE%\.local\bin\codex.cmd` that calls the vendored `codex.exe` with the bypass flag and passes meta subcommands through. The bash wrapper cannot execute on Windows and only shadowed the real launcher.
+- **x86_64 instruction patches**: ported Gate 12 (exec-policy Forbidden-on-Never) and Gate 20 (network connect non-public-ip) to x86_64. Each was derived against 0.139.0 (pefile + capstone) and applied to a copy that still ran `--version`. arm64 variants coexist and self-skip via the byte-match guard.
+- **Dry-run label**: `instr_replace` no longer reports `no-op (already applied)` for a non-matching anchor; it distinguishes already-applied from not-applicable (wrong arch/version).
+- **`.gitattributes`**: LF repo-wide, CRLF for `.cmd`/`.bat`/`.ps1`, and the POSIX wrapper pinned to LF so its shebang survives a Windows checkout.
+- **Tests**: skip POSIX execute-bit assertions on Windows; added `test_windows_support.py`. Suite: 76 passed, 1 skipped on Windows.
+
 ## [0.129.0] — 2026-05-09
 
 ### Stage 2/3 — depth pass
