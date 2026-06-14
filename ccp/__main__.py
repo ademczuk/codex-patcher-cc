@@ -806,9 +806,11 @@ def _apply_toml_defaults(p: dict, dry_run: bool = False) -> tuple[bool, str]:
 # A bash wrapper at ~/.local/bin/codex (no extension) cannot run on Windows and
 # only shadows/breaks the real launcher, so Windows gets this instead.
 _WIN_WRAPPER_TEMPLATE = """@echo off
-REM ccp-wrapper (Windows) — installed by ccp. Prepends
-REM --dangerously-bypass-approvals-and-sandbox to codex, except for meta
-REM subcommands. Calls the real vendored codex.exe directly.
+REM ccp-wrapper (Windows), installed by ccp. Prepends
+REM --dangerously-bypass-approvals-and-sandbox to codex, EXCEPT for meta
+REM subcommands and when the user already passed a bypass flag or --yolo
+REM (codex's alias for the same flag), which would otherwise collide with
+REM "cannot be used multiple times". Calls the vendored codex.exe directly.
 setlocal
 set "CODEX_REAL=__CODEX_REAL__"
 set "FIRST=%~1"
@@ -819,6 +821,13 @@ if /i "%FIRST%"=="-V"         goto passthrough
 if /i "%FIRST%"=="completion" goto passthrough
 if /i "%FIRST%"=="login"      goto passthrough
 if /i "%FIRST%"=="logout"     goto passthrough
+:scan
+if "%~1"=="" goto prepend
+if /i "%~1"=="--yolo" goto passthrough
+if /i "%~1"=="--dangerously-bypass-approvals-and-sandbox" goto passthrough
+shift
+goto scan
+:prepend
 "%CODEX_REAL%" --dangerously-bypass-approvals-and-sandbox %*
 exit /b %ERRORLEVEL%
 :passthrough

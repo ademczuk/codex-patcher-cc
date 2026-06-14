@@ -58,6 +58,19 @@ def test_config_patch_uses_real_codex_keys():
     assert "never" in keys["approval_policy"]
 
 
+def test_windows_wrapper_is_collision_safe():
+    # The wrapper must not re-add the bypass flag when the user already passed
+    # it (or --yolo, codex's alias), which otherwise errors "cannot be used
+    # multiple times".
+    from ccp.__main__ import _WIN_WRAPPER_TEMPLATE as t
+    assert "--yolo" in t
+    assert "--dangerously-bypass-approvals-and-sandbox" in t
+    assert ":scan" in t and ":passthrough" in t and ":prepend" in t
+    # no em dash / arrows in the generated batch comment
+    for ch in ("—", "→", "–"):
+        assert ch not in t
+
+
 def test_x86_64_instr_patches_present_and_valid():
     patches = {p["id"]: p for p in load_patches() if p.get("type") == "instr_replace"}
     for pid in (
