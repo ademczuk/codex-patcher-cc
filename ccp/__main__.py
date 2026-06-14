@@ -988,33 +988,52 @@ def cmd_patch(args) -> int:
             for p in applicable:
                 applied_n = 0
 
-                # instr_replace dry-run: check anchor + marker + match bytes
+                # instr_replace dry-run: check anchor + marker + match bytes.
+                # Track each sub's outcome separately so "already applied" is not
+                # conflated with "anchor/bytes not found" (the latter means the
+                # patch cannot apply to this binary, e.g. wrong arch).
                 if p.get("type") == "instr_replace":
                     raw = bytes(data_full)
+                    already_n = 0   # marker matched — patch is live
+                    nomatch_n = 0   # anchor missing or bytes differ — cannot apply
                     for sub in p.get("patches", []):
                         anchor = sub.get("anchor", "").encode("utf-8", "surrogateescape")
                         ofs    = int(sub.get("offset_from_anchor", 0))
                         mbx    = sub.get("match_bytes_hex", "")
                         amk    = sub.get("applied_marker_hex")
                         if not (anchor and mbx):
+                            nomatch_n += 1
                             continue
                         ap = raw.find(anchor)
                         if ap < 0:
+                            nomatch_n += 1
                             continue
                         target_off = ap + ofs
                         if target_off < 0 or target_off + len(mbx) // 2 > len(raw):
+                            nomatch_n += 1
                             continue
                         actual = raw[target_off: target_off + len(mbx) // 2]
                         try:
                             expected = bytes.fromhex(mbx)
                             marker_bytes = bytes.fromhex(amk) if amk else None
                         except ValueError:
+                            nomatch_n += 1
                             continue
                         if marker_bytes and actual == marker_bytes:
+                            already_n += 1
                             continue  # already applied
                         if actual == expected:
                             applied_n += 1
-                    msg = "no-op (already applied)" if applied_n == 0 else f"would apply {applied_n} instr-replace(s)"
+                        else:
+                            nomatch_n += 1
+                    if applied_n:
+                        msg = f"would apply {applied_n} instr-replace(s)"
+                    elif already_n and not nomatch_n:
+                        msg = "no-op (already applied)"
+                    elif already_n:
+                        msg = f"{already_n} already applied, {nomatch_n} not matched (wrong arch/version?)"
+                    else:
+                        msg = "skip (anchor/bytes not found — not applicable to this binary)"
                     print(f"  {G}ok{X}    {p.get('id','?'):40s}  {msg}")
                     ok += 1
                     continue

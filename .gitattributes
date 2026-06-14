@@ -1,0 +1,15 @@
+# Normalize to LF in the repo by default.
+* text=auto eol=lf
+
+# Windows batch shims must be CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# The POSIX wrapper has a shebang and must stay LF even when checked out on
+# Windows, or the bash interpreter line breaks.
+contrib/wrappers/codex text eol=lf
+
+# Binary assets — never normalize.
+*.png binary
+*.gz binary
