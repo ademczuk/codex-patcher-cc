@@ -1,0 +1,53 @@
+{
+  "id": "instr-network-connect-non-public-ip-allow-x86_64",
+  "type": "instr_replace",
+  "arch": "x86_64",
+  "description": "Gate 20 (network-connect-non-public-ip), x86_64 port of patch 12. The connect policy check compiles to `test al, al; je <ok>; lea rdx, [rip+anchor]; mov r8d, 0x21` where the anchor is 'network target rejected by policy' (33 bytes) and the fall-through builds the PermissionDenied error. al != 0 means reject. The Rust generic connect() is monomorphized into 4 call sites, so there are 4 identical gates. Flipping each `je` (74 XX) to `jmp` (EB XX) makes the OK path always taken, so the reject error is never built. All four sub-patches anchor to the first occurrence of the string and use distinct offsets. Length-preserving: je rel8 (2 bytes) -> jmp rel8 (2 bytes). Verified on 0.139.0: all four bytes match and the patched binary still launches.",
+  "required": false,
+  "patches": [
+    {
+      "anchor": "network target rejected by policy",
+      "offset_from_anchor": -193811773,
+      "match_bytes_hex": "7445",
+      "match_disasm": "je <ok>  (site 1: skip reject when allow; flip to always-skip)",
+      "replace_bytes_hex": "eb45",
+      "replace_disasm": "jmp <ok>  (unconditional; reject path never reached)",
+      "applied_marker_hex": "eb45",
+      "description": "site 1 of 4: je->jmp to skip the connect reject branch"
+    },
+    {
+      "anchor": "network target rejected by policy",
+      "offset_from_anchor": -115563949,
+      "match_bytes_hex": "7445",
+      "match_disasm": "je <ok>  (site 2)",
+      "replace_bytes_hex": "eb45",
+      "replace_disasm": "jmp <ok>",
+      "applied_marker_hex": "eb45",
+      "description": "site 2 of 4: je->jmp to skip the connect reject branch"
+    },
+    {
+      "anchor": "network target rejected by policy",
+      "offset_from_anchor": -86132013,
+      "match_bytes_hex": "7445",
+      "match_disasm": "je <ok>  (site 3)",
+      "replace_bytes_hex": "eb45",
+      "replace_disasm": "jmp <ok>",
+      "applied_marker_hex": "eb45",
+      "description": "site 3 of 4: je->jmp to skip the connect reject branch"
+    },
+    {
+      "anchor": "network target rejected by policy",
+      "offset_from_anchor": -75997681,
+      "match_bytes_hex": "744c",
+      "match_disasm": "je <ok>  (site 4)",
+      "replace_bytes_hex": "eb4c",
+      "replace_disasm": "jmp <ok>",
+      "applied_marker_hex": "eb4c",
+      "description": "site 4 of 4: je->jmp to skip the connect reject branch"
+    }
+  ],
+  "anchor_strings": [
+    "network target rejected by policy"
+  ],
+  "version_last_tested": "0.139.0"
+}

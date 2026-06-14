@@ -1,0 +1,23 @@
+{
+  "id": "instr-exec-policy-forbidden-on-never-nop-x86_64",
+  "type": "instr_replace",
+  "arch": "x86_64",
+  "description": "Gate 12 (exec-policy Decision::Forbidden-on-Never), x86_64 port of patch 13. In render_decision_for_unmatched_command() the code compares the AskForApproval discriminant (cmp edx, 3) and does `jne <error>` to the Forbidden error-emit block, which loads the 63-char string 'approval required by policy, but AskForApproval is set to Never' (mov esi, 0x3f; lea r15, [rip+anchor]) and builds the error. NOP-ing the jne makes execution always fall through to the allow/continue path, so Forbidden is never taken under AskForApproval::Never. Length-preserving: jne rel32 (0f 85 28 01 00 00, 6 bytes) -> 6-byte NOP (66 0f 1f 44 00 00). Verified on 0.139.0: bytes match at the computed offset and the patched binary still launches (codex --version).",
+  "required": false,
+  "patches": [
+    {
+      "anchor": "approval required by policy, but AskForApproval is set to Never",
+      "offset_from_anchor": -123538882,
+      "match_bytes_hex": "0f8528010000",
+      "match_disasm": "jne 0x144fbc37c  (branch to Forbidden error-emit block when discriminant != 3)",
+      "replace_bytes_hex": "660f1f440000",
+      "replace_disasm": "nop (6-byte)  — fall through to the allow/continue path",
+      "applied_marker_hex": "660f1f440000",
+      "description": "NOP the jne gate so Decision::Forbidden is never taken under AskForApproval::Never (x86_64)"
+    }
+  ],
+  "anchor_strings": [
+    "approval required by policy, but AskForApproval is set to Never"
+  ],
+  "version_last_tested": "0.139.0"
+}
