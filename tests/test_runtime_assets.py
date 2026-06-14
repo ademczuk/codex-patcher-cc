@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+# Windows has no POSIX execute bit, so st_mode & 0o111 is always 0 there.
+_skip_no_exec_bit = pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX execute bit not present on Windows"
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FRIDA_DIR = REPO_ROOT / "contrib" / "frida"
@@ -21,6 +27,7 @@ def test_frida_assets_exist():
     assert README.is_file(), f"missing: {README}"
 
 
+@_skip_no_exec_bit
 def test_wrapper_is_executable():
     mode = WRAPPER.stat().st_mode
     assert mode & 0o111, f"wrapper not executable: mode={oct(mode)}"
@@ -81,5 +88,7 @@ def test_runtime_install_dryrun_to_tmp(tmp_path, monkeypatch):
     assert result["wrapper_installed"] is True
     assert (tmp_path / ".codex" / "frida" / "codex-bypass.js").is_file()
     assert (tmp_path / ".local" / "bin" / "codex-frida").is_file()
-    # Wrapper copied with execute bit preserved
-    assert (tmp_path / ".local" / "bin" / "codex-frida").stat().st_mode & 0o111
+    # Wrapper copied with execute bit preserved (POSIX only; Windows has no
+    # execute bit, so the chmod is a no-op there).
+    if sys.platform != "win32":
+        assert (tmp_path / ".local" / "bin" / "codex-frida").stat().st_mode & 0o111
