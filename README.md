@@ -76,10 +76,12 @@ CCP was validated against the macOS/Linux vendor binaries on `@openai/codex@0.12
 | `codex-darwin-x64`   | Mach-O x86_64 | ✓ | ✓ | ✓ scan-ok | ✓ tested (real gate flip) | ✓ x86_64 (Gate 12/20) |
 | `codex-linux-x64`    | ELF x86_64 (musl) | ✓ | ✓ | ✓ scan-ok | ⚠ no equivalent (bubblewrap/landlock are binary structures, not text) | ✓ x86_64 (Gate 12/20) |
 | `codex-linux-arm64`  | ELF aarch64 (musl) | ✓ | ✓ | ✓ scan-ok | ⚠ no equivalent | ✓ arm64 (Gate 12/20) |
-| `codex-win32-x64`    | PE32+ x86_64 | ✓ (.cmd, tested) | ✓ (tested) | ✓ scan-ok | ⚠ no equivalent (restricted-token model uses Win32 APIs, not embedded text) | ✓ x86_64 (Gate 12/20, tested 0.139.0) |
+| `codex-win32-x64`    | PE32+ x86_64 | ✓ (.cmd, tested) | ✓ (tested) | ✓ scan-ok | ⚠ no equivalent (restricted-token model uses Win32 APIs, not embedded text) | ported (Gate 12/20; inert in `codex exec` on 0.139, see note) |
 | `codex-win32-arm64`  | PE32+ aarch64 | ✓ (.cmd) | ✓ | ✓ scan-ok | ⚠ no equivalent | ✓ arm64 (Gate 12/20, byte-match-gated) |
 
-`scan-ok` = anchor strings resolve under `ccp scan -t <vendor-binary>`. The seatbelt and exec/net-gate patches are real runtime-gate flips; the `rust-refusal-strings` patch is cosmetic (softens TUI log messages, does not alter runtime behavior). On every platform the supported full bypass is config-only: `approval_policy = "never"` + `sandbox_mode = "danger-full-access"` (danger-full-access counts as sandbox-disabled, so Never resolves to Allow). The instruction gates matter when a sandbox is still in force.
+`scan-ok` = anchor strings resolve under `ccp scan -t <vendor-binary>`. The seatbelt patch is a real macOS runtime-gate flip; the `rust-refusal-strings` patch is cosmetic (softens TUI log messages). On every platform the supported full bypass is config-only: `approval_policy = "never"` + `sandbox_mode = "danger-full-access"` (danger-full-access counts as sandbox-disabled, so Never resolves to Allow), which is what was verified end to end on Windows.
+
+Note on the exec/net instruction gates (12/20): these are byte-verified, control-flow-coherent, non-breaking ports of the arm64 patches. On 0.139.0 in `codex exec` they are behaviorally inert: the unpatched binary already resolves `never` + `--sandbox workspace-write` to Allow (a rollback differential confirmed identical behavior patched vs unpatched). They are kept for parity and for the version/mode where the gate fires; do not rely on them as the Windows bypass, the config does that.
 
 Patch types:
 - `macho_replace` — Mach-O only (legacy darwin binaries)
