@@ -54,7 +54,11 @@ _PLATFORM_PKGS = [
 ]
 
 # Vendor path pattern inside each platform package:
-# <pkg>/vendor/<triple>/codex/codex  (or codex.exe on Windows)
+# <pkg>/vendor/<triple>/<subdir>/codex  (or codex.exe on Windows)
+# The <subdir> moved from "codex/" to "bin/" in current npm builds; every
+# Windows build ships the binary under bin/. Both layouts are enumerated so
+# detection is layout-agnostic, and find_target() has a glob fallback for any
+# layout not listed here.
 _VENDOR_SUBDIRS = [
     "vendor/aarch64-apple-darwin/codex/codex",
     "vendor/x86_64-apple-darwin/codex/codex",
@@ -62,28 +66,78 @@ _VENDOR_SUBDIRS = [
     "vendor/x86_64-unknown-linux-gnu/codex/codex",
     "vendor/aarch64-pc-windows-msvc/codex/codex.exe",
     "vendor/x86_64-pc-windows-msvc/codex/codex.exe",
+    # bin/ layout (current npm distribution, including all Windows builds)
+    "vendor/aarch64-apple-darwin/bin/codex",
+    "vendor/x86_64-apple-darwin/bin/codex",
+    "vendor/aarch64-unknown-linux-gnu/bin/codex",
+    "vendor/x86_64-unknown-linux-gnu/bin/codex",
+    "vendor/aarch64-pc-windows-msvc/bin/codex.exe",
+    "vendor/x86_64-pc-windows-msvc/bin/codex.exe",
 ]
+
+# Filenames the Rust binary may use, for the glob fallback.
+_BINARY_NAMES = ("codex", "codex.exe")
 
 
 # ── target discovery ──────────────────────────────────────────────────────────
 
 def _npm_global_roots() -> list[Path]:
     roots: list[Path] = []
-    try:
-        r = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0 and r.stdout.strip():
-            roots.insert(0, Path(r.stdout.strip()))
-    except Exception:
-        pass
+    # `npm` is npm.cmd on Windows; bare "npm" via subprocess (no shell) fails to
+    # resolve there, so try both names.
+    npm_cmds = ["npm.cmd", "npm"] if sys.platform == "win32" else ["npm"]
+    for npm_cmd in npm_cmds:
+        try:
+            r = subprocess.run([npm_cmd, "root", "-g"], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                roots.insert(0, Path(r.stdout.strip()))
+                break
+        except Exception:
+            continue
     home = Path.home()
+    # Windows: npm global modules live under %APPDATA%\npm\node_modules.
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        roots.append(Path(appdata) / "npm" / "node_modules")
     roots += [
         home / ".npm-global/lib/node_modules",
         home / ".local/lib/node_modules",
+        home / "AppData/Roaming/npm/node_modules",
         Path("/opt/homebrew/lib/node_modules"),
         Path("/usr/local/lib/node_modules"),
         Path("/usr/lib/node_modules"),
     ]
-    return roots
+    # De-dupe while preserving order.
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for r in roots:
+        k = str(r).lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(r)
+    return uniq
+
+
+def _glob_vendor_binary(plat_dir: Path) -> Path | None:
+    """
+    Layout-agnostic fallback: find the Rust binary anywhere under <plat_dir>/vendor.
+    Returns the largest matching file over 1 MB (the real binary, not a shim).
+    """
+    vendor = plat_dir / "vendor"
+    if not vendor.is_dir():
+        return None
+    best: Path | None = None
+    best_size = 0
+    for name in _BINARY_NAMES:
+        for p in vendor.rglob(name):
+            try:
+                if p.is_file():
+                    sz = p.stat().st_size
+                    if sz > 1_000_000 and sz > best_size:
+                        best, best_size = p, sz
+            except OSError:
+                continue
+    return best
 
 
 def find_target() -> Path | None:
@@ -106,6 +160,10 @@ def find_target() -> Path | None:
                 p = plat_dir / vendor_suffix
                 if p.exists() and p.stat().st_size > 1_000_000:
                     return p
+            # Fallback: glob the vendor tree if the layout is not enumerated.
+            g = _glob_vendor_binary(plat_dir)
+            if g is not None:
+                return g
         # Also check vendor directly under codex-{platform} (flat layout)
         for plat_pkg in _PLATFORM_PKGS:
             # Look for platform-named dirs adjacent to node_modules
@@ -117,6 +175,9 @@ def find_target() -> Path | None:
                 p = plat_dir2 / vendor_suffix
                 if p.exists() and p.stat().st_size > 1_000_000:
                     return p
+            g = _glob_vendor_binary(plat_dir2)
+            if g is not None:
+                return g
 
     # Last resort: resolve `which codex` from PATH and check for sibling binary
     try:
