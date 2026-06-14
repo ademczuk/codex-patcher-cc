@@ -152,20 +152,20 @@ def find_target() -> Path | None:
             continue
         # Walk platform sub-packages nested under main package
         node_mods = codex_pkg / "node_modules"
-        for plat_pkg in _PLATFORM_PKGS:
+        for plat_pkg in _ordered_platform_pkgs():
             plat_dir = node_mods / plat_pkg
             if not plat_dir.is_dir():
                 continue
             for vendor_suffix in _VENDOR_SUBDIRS:
                 p = plat_dir / vendor_suffix
-                if p.exists() and p.stat().st_size > 1_000_000:
+                if p.exists() and p.stat().st_size > 1_000_000 and _candidate_matches_host(p):
                     return p
             # Fallback: glob the vendor tree if the layout is not enumerated.
             g = _glob_vendor_binary(plat_dir)
-            if g is not None:
+            if g is not None and _candidate_matches_host(g):
                 return g
         # Also check vendor directly under codex-{platform} (flat layout)
-        for plat_pkg in _PLATFORM_PKGS:
+        for plat_pkg in _ordered_platform_pkgs():
             # Look for platform-named dirs adjacent to node_modules
             pkg_name = plat_pkg.split("/")[-1]  # e.g. codex-darwin-arm64
             plat_dir2 = npm_root / plat_pkg
@@ -173,10 +173,10 @@ def find_target() -> Path | None:
                 continue
             for vendor_suffix in _VENDOR_SUBDIRS:
                 p = plat_dir2 / vendor_suffix
-                if p.exists() and p.stat().st_size > 1_000_000:
+                if p.exists() and p.stat().st_size > 1_000_000 and _candidate_matches_host(p):
                     return p
             g = _glob_vendor_binary(plat_dir2)
-            if g is not None:
+            if g is not None and _candidate_matches_host(g):
                 return g
 
     # Last resort: resolve `which codex` from PATH and check for sibling binary
@@ -189,7 +189,7 @@ def find_target() -> Path | None:
             if candidate_root.is_dir():
                 codex_pkg = candidate_root / _PKG
                 node_mods = codex_pkg / "node_modules"
-                for plat_pkg in _PLATFORM_PKGS:
+                for plat_pkg in _ordered_platform_pkgs():
                     plat_dir = node_mods / plat_pkg
                     if not plat_dir.is_dir():
                         continue
@@ -235,6 +235,100 @@ def _binary_format(data: bytes | bytearray) -> str:
         except Exception:
             pass
     return "unknown"
+
+
+def _binary_machine(data: bytes | bytearray) -> str:
+    """Return the CPU arch ('x86_64', 'arm64', or 'unknown') for a Mach-O / ELF /
+    PE header. Used to gate instr_replace patches and host-binary discovery so an
+    x86_64 opcode is never written into an arm64 binary (or vice versa)."""
+    fmt = _binary_format(data)
+    try:
+        if fmt == "pe":
+            e_lfanew = _struct.unpack_from("<I", data, 0x3C)[0]
+            machine  = _struct.unpack_from("<H", data, e_lfanew + 4)[0]
+            return {0x8664: "x86_64", 0xAA64: "arm64"}.get(machine, "unknown")
+        if fmt == "elf":
+            end = "<" if data[5] == 1 else ">"
+            em  = _struct.unpack_from(end + "H", data, 0x12)[0]
+            return {0x3E: "x86_64", 0xB7: "arm64"}.get(em, "unknown")
+        if fmt == "macho":
+            magic = _struct.unpack_from(">I", data, 0)[0]
+            if magic in (0xCAFEBABE, 0xBEBAFECA, 0xCAFEBABF, 0xBFBAFECA):
+                return "unknown"  # fat binary carries multiple arches
+            end = ">" if magic in (0xFEEDFACF, 0xFEEDFACE) else "<"
+            cputype = _struct.unpack_from(end + "I", data, 4)[0]
+            # CPU_TYPE_X86_64 = 0x01000007, CPU_TYPE_ARM64 = 0x0100000C
+            return {0x01000007: "x86_64", 0x0100000C: "arm64"}.get(cputype, "unknown")
+    except Exception:
+        return "unknown"
+    return "unknown"
+
+
+def _host_format_machine() -> tuple[str, str]:
+    """(format, machine) the host can execute natively, e.g. ('pe','x86_64')."""
+    import platform as _plat
+    m = _plat.machine().lower()
+    machine = "arm64" if m in ("arm64", "aarch64") else (
+        "x86_64" if m in ("x86_64", "amd64", "x64") else "unknown")
+    if sys.platform == "win32":
+        fmt = "pe"
+    elif sys.platform == "darwin":
+        fmt = "macho"
+    elif sys.platform.startswith("linux"):
+        fmt = "elf"
+    else:
+        fmt = "unknown"
+    return fmt, machine
+
+
+def _candidate_matches_host(path: Path) -> bool:
+    """True if `path` is a binary the host can run (format + arch match). Guards
+    find_target against selecting a foreign-platform vendor binary when several
+    @openai/codex-<platform> packages are present in one node_modules tree."""
+    host_fmt, host_machine = _host_format_machine()
+    if host_fmt == "unknown":
+        return True  # unknown host — do not block discovery
+    try:
+        with path.open("rb") as f:
+            head = f.read(0x1000)
+    except OSError:
+        return False
+    if _binary_format(head) != host_fmt:
+        return False
+    if host_machine != "unknown":
+        bm = _binary_machine(head)
+        if bm != "unknown" and bm != host_machine:
+            return False
+    return True
+
+
+def _ordered_platform_pkgs() -> list[str]:
+    """_PLATFORM_PKGS with the host's own package first, so discovery prefers the
+    runnable binary over any other platform package that happens to be present."""
+    host_fmt, host_machine = _host_format_machine()
+    triple = {
+        ("pe", "x86_64"): "codex-win32-x64",   ("pe", "arm64"): "codex-win32-arm64",
+        ("macho", "x86_64"): "codex-darwin-x64", ("macho", "arm64"): "codex-darwin-arm64",
+        ("elf", "x86_64"): "codex-linux-x64",   ("elf", "arm64"): "codex-linux-arm64",
+    }.get((host_fmt, host_machine))
+    host_pkg = f"@openai/{triple}" if triple else None
+    if host_pkg and host_pkg in _PLATFORM_PKGS:
+        return [host_pkg] + [p for p in _PLATFORM_PKGS if p != host_pkg]
+    return list(_PLATFORM_PKGS)
+
+
+def _toml_top_level_text(existing_text: str) -> str:
+    """Return only the top-level portion of a TOML document (everything before
+    the first [table] / [[array-of-tables]] header). Keys appearing after a table
+    header are scoped to that table, so a presence check for a TOP-LEVEL default
+    must look only here — otherwise a key nested under e.g. [profiles.work] reads
+    as already-present and the global default is silently skipped."""
+    out: list[str] = []
+    for line in existing_text.splitlines():
+        if line.lstrip().startswith("["):
+            break
+        out.append(line)
+    return "\n".join(out)
 
 
 # ── Mach-O section helpers ────────────────────────────────────────────────────
@@ -553,21 +647,71 @@ def patch_binary_inplace(binary: Path, patches: list[dict]) -> dict:
         # Different schema (anchor + offset_from_anchor + match_bytes_hex)
         # so handled separately from the regex/byte-search loop below.
         if p.get("type") == "instr_replace":
-            from .instr_patcher import apply_instr_patch
+            from .instr_patcher import apply_instr_patch, find_anchor
             arch = p.get("arch", "arm64")
-            for sub in p.get("patches", []):
+            subs = p.get("patches", [])
+
+            # Hard arch gate (Finding 2): do not rely on a 2-byte coincidence to
+            # keep x86_64 opcodes out of an arm64 binary. If the patch declares an
+            # arch and the binary's machine is known and different, skip entirely.
+            machine = _binary_machine(data)
+            if arch and machine != "unknown" and arch != machine:
+                per_patch.append({"id": p.get("id", "?"), "applied": 0,
+                                  "skipped": len(subs),
+                                  "reason": f"arch {arch} != binary {machine}"})
+                skipped_total += len(subs)
+                continue
+
+            # Atomic preflight (Finding 1): classify every site against the
+            # ORIGINAL bytes as apply / already / miss without writing. A
+            # multi-site patch (e.g. the four network gates) is all-or-nothing:
+            # if any required site misses under version drift, abort the whole
+            # patch so a partially-patched binary is never produced.
+            raw = bytes(data)
+            states: list[str] = []
+            for sub in subs:
                 anchor = sub.get("anchor", "")
-                ofs    = int(sub.get("offset_from_anchor", 0))
                 mbx    = sub.get("match_bytes_hex", "")
                 rbx    = sub.get("replace_bytes_hex", "")
                 amk    = sub.get("applied_marker_hex")
+                optional = bool(sub.get("optional", False))
                 if not (anchor and mbx and rbx):
-                    skipped_n += 1
+                    states.append("optional" if optional else "miss")
+                    continue
+                ap = find_anchor(raw, anchor)
+                n  = len(mbx) // 2
+                state = "miss"
+                if ap is not None:
+                    off = ap + int(sub.get("offset_from_anchor", 0))
+                    if 0 <= off and off + n <= len(raw):
+                        cur = raw[off:off + n]
+                        if amk and cur == bytes.fromhex(amk):
+                            state = "already"
+                        elif cur == bytes.fromhex(mbx):
+                            state = "apply"
+                if state == "miss" and optional:
+                    state = "optional"
+                states.append(state)
+
+            if "miss" in states:
+                missed = sum(1 for s in states if s == "miss")
+                per_patch.append({"id": p.get("id", "?"), "applied": 0,
+                                  "skipped": len(subs),
+                                  "reason": f"atomic abort: {missed}/{len(subs)} site(s) not "
+                                            f"matchable (version drift?), no bytes written"})
+                skipped_total += len(subs)
+                continue
+
+            # Every site is appliable or already-applied — safe to write.
+            for sub, state in zip(subs, states):
+                if state != "apply":
                     continue
                 applied, _reason = apply_instr_patch(
-                    data, arch=arch, anchor=anchor,
-                    offset_from_anchor=ofs, match_bytes_hex=mbx,
-                    replace_bytes_hex=rbx, applied_marker_hex=amk,
+                    data, arch=arch, anchor=sub.get("anchor", ""),
+                    offset_from_anchor=int(sub.get("offset_from_anchor", 0)),
+                    match_bytes_hex=sub.get("match_bytes_hex", ""),
+                    replace_bytes_hex=sub.get("replace_bytes_hex", ""),
+                    applied_marker_hex=sub.get("applied_marker_hex"),
                 )
                 if applied:
                     applied_n += 1
@@ -780,11 +924,14 @@ def _apply_toml_defaults(p: dict, dry_run: bool = False) -> tuple[bool, str]:
     if config_path.is_file():
         existing_text = config_path.read_text(encoding="utf-8")
 
+    top_level = _toml_top_level_text(existing_text)
     added = []
     for key, val in defaults.items():
-        # Simple check: key = ... already present as a top-level entry
+        # Present only when set TOP-LEVEL. A same-named key nested under a
+        # [table] (e.g. approval_policy under [profiles.work]) does not satisfy a
+        # top-level default, so scan only the pre-table prefix.
         pattern = re.compile(r"^\s*" + re.escape(key) + r"\s*=", re.MULTILINE)
-        if pattern.search(existing_text):
+        if pattern.search(top_level):
             continue
         added.append(f'{key} = {val}')
 
@@ -911,13 +1058,18 @@ def _is_binary_patch(p: dict) -> bool:
     return p.get("type") in _BINARY_PATCH_TYPES
 
 
-def _patch_applies_to_format(p: dict, fmt: str) -> bool:
+def _patch_applies_to_format(p: dict, fmt: str, machine: str | None = None) -> bool:
     """
     Decide whether a binary patch is allowed against a binary of `fmt`.
     - `macho_replace` -> macho only (legacy, pre-multi-platform)
     - `elf_replace`   -> elf only
     - `pe_replace`    -> pe only
     - `binary_replace` -> any format unless the patch declares `formats: [...]`
+    - `instr_replace` -> format-agnostic, but arch-gated when `machine` is known
+
+    `machine` ('x86_64' | 'arm64' | None) is the binary's CPU arch. When supplied,
+    an instr_replace patch whose declared `arch` does not match is rejected here,
+    so a wrong-arch patch is never even offered to the apply path.
     """
     t = p.get("type")
     if t == "macho_replace":
@@ -932,14 +1084,17 @@ def _patch_applies_to_format(p: dict, fmt: str) -> bool:
             return fmt in formats
         return fmt in ("macho", "elf", "pe")
     if t == "instr_replace":
-        # arch-gated: arm64 patches only apply to arm64 binaries; x86_64 to x86_64.
-        # Format-agnostic since instr_replace operates on raw bytes via anchor + offset.
         formats = p.get("formats")
         if formats and fmt not in formats:
             return False
-        # Cheap arch check: caller may have stamped fmt with a hint, but we don't
-        # track arch here. Accept and let apply_instr_patch's byte-match guard skip
-        # mismatches (its match_bytes_hex check catches the wrong arch automatically).
+        # Real arch gate: arm64 patches only apply to arm64 binaries, x86_64 to
+        # x86_64. When the caller knows the binary machine, enforce it. The apply
+        # path (patch_binary_inplace) enforces this again as a hard guard so the
+        # byte-match is never the only thing standing between an x86_64 opcode and
+        # an arm64 binary.
+        arch = p.get("arch")
+        if machine and machine != "unknown" and arch and arch != machine:
+            return False
         return True
     return False
 
@@ -987,8 +1142,9 @@ def cmd_patch(args) -> int:
     else:
         data_full = bytearray(target.read_bytes())
         fmt = _binary_format(data_full)
-        applicable  = [p for p in binary_patches if _patch_applies_to_format(p, fmt)]
-        skipped_fmt = [p for p in binary_patches if not _patch_applies_to_format(p, fmt)]
+        machine = _binary_machine(data_full)
+        applicable  = [p for p in binary_patches if _patch_applies_to_format(p, fmt, machine)]
+        skipped_fmt = [p for p in binary_patches if not _patch_applies_to_format(p, fmt, machine)]
         for p in skipped_fmt:
             print(f"  {Y}skip{X} {p.get('id','?'):40s}  type={p.get('type')} not applicable to fmt={fmt}")
             skip += 1
@@ -1124,13 +1280,14 @@ def cmd_verify(args) -> int:
 
     data   = bytearray(target.read_bytes())
     fmt    = _binary_format(data)
+    machine = _binary_machine(data)
     bounds = _binary_string_bounds(data)
 
     missing = 0
     for p in load_patches():
         if not _is_binary_patch(p):
             continue
-        if not _patch_applies_to_format(p, fmt):
+        if not _patch_applies_to_format(p, fmt, machine):
             continue
         for sub in p.get("patches", []):
             if not sub.get("required", True):
@@ -1230,13 +1387,16 @@ def cmd_scan(args) -> int:
 
     try:
         with target.open("rb") as _fh:
-            fmt = _binary_format(_fh.read(0x1000))
+            _head = _fh.read(0x1000)
+        fmt = _binary_format(_head)
+        machine = _binary_machine(_head)
     except Exception:
         fmt = "unknown"
+        machine = "unknown"
 
     patches = _scanner.load_patches_from_dir(PATCH_DIR)
-    # Filter to patches that apply to this binary's format.
-    patches = [p for p in patches if _patch_applies_to_format(p, fmt)]
+    # Filter to patches that apply to this binary's format + arch.
+    patches = [p for p in patches if _patch_applies_to_format(p, fmt, machine)]
     sc      = _scanner.SigScanner(text)
     rows    = sc.scan_patches(patches)
 
@@ -1283,9 +1443,10 @@ def cmd_doctor(args) -> int:
     # ── per-patch applied status ──────────────────────────────────────────────
     if target:
         data   = bytearray(target.read_bytes())
+        machine = _binary_machine(data)
         bounds = _binary_string_bounds(data)
         for p in binary_patches:
-            if not _patch_applies_to_format(p, fmt):
+            if not _patch_applies_to_format(p, fmt, machine):
                 print(f"  {DOT} skip       : {p.get('id','?')}  (not applicable to fmt={fmt})")
                 continue
             applied = False
@@ -1352,7 +1513,7 @@ def cmd_doctor(args) -> int:
             # a macOS-only seatbelt patch is not "drift" on a Windows PE.
             _drift_patches = [
                 p for p in _scanner.load_patches_from_dir(PATCH_DIR)
-                if _patch_applies_to_format(p, fmt)
+                if _patch_applies_to_format(p, fmt, _binary_machine(bytearray(target.read_bytes())))
             ]
             rows = _scanner.SigScanner(text).scan_patches(_drift_patches)
             drift   = [r["id"] for r in rows if r["status"] == "drift"]
@@ -1677,6 +1838,9 @@ def cmd_install_config(args) -> int:
         print(f"  {G}no-op{X}  ccp defaults already in config.toml")
         return 0
 
+    # Only count a key as already-set when it is TOP-LEVEL; a nested key under a
+    # [table] does not satisfy a top-level default (see _toml_top_level_text).
+    top_level = _toml_top_level_text(existing_text)
     # Parse key=value lines from template, skip section headers and comments
     for line in template.splitlines():
         stripped = line.strip()
@@ -1686,8 +1850,8 @@ def cmd_install_config(args) -> int:
             continue
         key = stripped.split("=", 1)[0].strip()
         pattern = re.compile(r"^\s*" + re.escape(key) + r"\s*=", re.MULTILINE)
-        if pattern.search(existing_text):
-            continue  # operator already set this
+        if pattern.search(top_level):
+            continue  # operator already set this top-level
         added.append(line)
 
     if not added:
