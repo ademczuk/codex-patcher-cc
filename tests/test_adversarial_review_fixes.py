@@ -172,3 +172,37 @@ def test_config_default_skipped_when_top_level(tmp_path):
     ok, msg = _apply_toml_defaults(p, dry_run=True)
     assert ok
     assert "already applied" in msg
+
+
+# ── Round 2 — atomic verdict reporting (Finding 3) ──────────────────────────
+
+def test_instr_verdict_mapping():
+    from ccp.__main__ import _instr_verdict
+    assert _instr_verdict(["apply", "miss"])[0] == "abort"      # partial -> abort
+    assert _instr_verdict(["miss", "miss"])[0] == "abort"
+    assert _instr_verdict(["already", "already"])[0] == "already"
+    assert _instr_verdict(["apply", "already"])[0] == "apply"
+    assert _instr_verdict(["optional", "optional"])[0] == "skip"
+
+
+# ── Round 2 — install-config repairs old marker installs (Finding 1) ────────
+
+def test_install_config_repairs_old_marker_install(tmp_path, monkeypatch):
+    from ccp.__main__ import cmd_install_config, _toml_top_level_text
+    import types
+    # Old/broken install: marker present, but the bypass keys are nested under a
+    # [table] (ineffective). Rerunning install-config must still add the top-level
+    # keys instead of no-opping on the marker.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        '# ccp: bypass defaults\n[profiles.work]\napproval_policy = "never"\n'
+        'sandbox_mode = "danger-full-access"\n', encoding="utf-8")
+
+    rc = cmd_install_config(types.SimpleNamespace())
+    assert rc == 0
+    top = _toml_top_level_text((codex_dir / "config.toml").read_text(encoding="utf-8"))
+    assert "approval_policy" in top
+    assert "sandbox_mode" in top

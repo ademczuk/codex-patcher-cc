@@ -179,12 +179,15 @@ def find_target() -> Path | None:
             if g is not None and _candidate_matches_host(g):
                 return g
 
-    # Last resort: resolve `which codex` from PATH and check for sibling binary
-    try:
-        r = subprocess.run(["which", "codex"], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0 and r.stdout.strip():
-            launcher = Path(r.stdout.strip()).resolve()
-            # codex.js is a launcher; look for the Rust binary in adjacent node_modules
+    # Last resort: resolve codex from PATH and look for the vendored binary in an
+    # adjacent node_modules tree. Uses shutil.which (PATHEXT-aware: finds
+    # codex.cmd on Windows, codex on POSIX) instead of Unix-only `which`, and
+    # still host-validates every candidate so the fallback cannot return a
+    # foreign-platform binary either.
+    launcher_str = shutil.which("codex") or shutil.which("codex.cmd")
+    if launcher_str:
+        try:
+            launcher = Path(launcher_str).resolve()
             candidate_root = launcher.parent.parent / "lib" / "node_modules"
             if candidate_root.is_dir():
                 codex_pkg = candidate_root / _PKG
@@ -195,10 +198,13 @@ def find_target() -> Path | None:
                         continue
                     for vendor_suffix in _VENDOR_SUBDIRS:
                         p = plat_dir / vendor_suffix
-                        if p.exists() and p.stat().st_size > 1_000_000:
+                        if p.exists() and p.stat().st_size > 1_000_000 and _candidate_matches_host(p):
                             return p
-    except Exception:
-        pass
+                    g = _glob_vendor_binary(plat_dir)
+                    if g is not None and _candidate_matches_host(g):
+                        return g
+        except Exception:
+            pass
 
     return None
 
@@ -620,6 +626,60 @@ def _can_run_native(fmt: str, data: bytes | bytearray | None = None) -> bool:
     return False
 
 
+def _classify_instr_sites(raw: bytes, subs: list[dict]) -> list[str]:
+    """Per-site state for an instr_replace patch against the ORIGINAL bytes:
+      'apply'    - match bytes present, can be written
+      'already'  - applied_marker present, patch is live
+      'optional' - site missing but marked optional, tolerated
+      'miss'     - anchor missing or bytes differ; site cannot apply
+    Shared by the apply path and the dry-run renderer so both agree on the
+    all-or-nothing outcome of a multi-site patch."""
+    from .instr_patcher import find_anchor
+    states: list[str] = []
+    for sub in subs:
+        anchor = sub.get("anchor", "")
+        mbx    = sub.get("match_bytes_hex", "")
+        rbx    = sub.get("replace_bytes_hex", "")
+        amk    = sub.get("applied_marker_hex")
+        optional = bool(sub.get("optional", False))
+        if not (anchor and mbx and rbx):
+            states.append("optional" if optional else "miss")
+            continue
+        ap = find_anchor(raw, anchor)
+        n  = len(mbx) // 2
+        state = "miss"
+        if ap is not None:
+            off = ap + int(sub.get("offset_from_anchor", 0))
+            if 0 <= off and off + n <= len(raw):
+                cur = raw[off:off + n]
+                if amk and cur == bytes.fromhex(amk):
+                    state = "already"
+                elif cur == bytes.fromhex(mbx):
+                    state = "apply"
+        if state == "miss" and optional:
+            state = "optional"
+        states.append(state)
+    return states
+
+
+def _instr_verdict(states: list[str]) -> tuple[str, str]:
+    """Map per-site states to (kind, message). kind in
+    {'apply','already','abort','skip'}. An 'abort' means the real apply writes
+    nothing (a required site misses), so it must never read as 'already applied'."""
+    n = len(states)
+    miss    = sum(1 for s in states if s == "miss")
+    napply  = sum(1 for s in states if s == "apply")
+    already = sum(1 for s in states if s == "already")
+    if miss:
+        return "abort", (f"atomic abort: {miss}/{n} site(s) not matchable "
+                         f"(version drift?), no bytes written")
+    if napply:
+        return "apply", f"would apply {napply}/{n} site(s)"
+    if already:
+        return "already", "no-op (already applied)"
+    return "skip", "skip (not applicable to this binary)"
+
+
 def patch_binary_inplace(binary: Path, patches: list[dict]) -> dict:
     """
     In-place Rust binary byte patcher (format-agnostic).
@@ -663,35 +723,12 @@ def patch_binary_inplace(binary: Path, patches: list[dict]) -> dict:
                 continue
 
             # Atomic preflight (Finding 1): classify every site against the
-            # ORIGINAL bytes as apply / already / miss without writing. A
-            # multi-site patch (e.g. the four network gates) is all-or-nothing:
-            # if any required site misses under version drift, abort the whole
-            # patch so a partially-patched binary is never produced.
+            # ORIGINAL bytes (shared classifier). A multi-site patch (e.g. the
+            # four network gates) is all-or-nothing: if any required site misses
+            # under version drift, abort the whole patch so a partially-patched
+            # binary is never produced.
             raw = bytes(data)
-            states: list[str] = []
-            for sub in subs:
-                anchor = sub.get("anchor", "")
-                mbx    = sub.get("match_bytes_hex", "")
-                rbx    = sub.get("replace_bytes_hex", "")
-                amk    = sub.get("applied_marker_hex")
-                optional = bool(sub.get("optional", False))
-                if not (anchor and mbx and rbx):
-                    states.append("optional" if optional else "miss")
-                    continue
-                ap = find_anchor(raw, anchor)
-                n  = len(mbx) // 2
-                state = "miss"
-                if ap is not None:
-                    off = ap + int(sub.get("offset_from_anchor", 0))
-                    if 0 <= off and off + n <= len(raw):
-                        cur = raw[off:off + n]
-                        if amk and cur == bytes.fromhex(amk):
-                            state = "already"
-                        elif cur == bytes.fromhex(mbx):
-                            state = "apply"
-                if state == "miss" and optional:
-                    state = "optional"
-                states.append(state)
+            states = _classify_instr_sites(raw, subs)
 
             if "miss" in states:
                 missed = sum(1 for s in states if s == "miss")
@@ -1153,54 +1190,19 @@ def cmd_patch(args) -> int:
             for p in applicable:
                 applied_n = 0
 
-                # instr_replace dry-run: check anchor + marker + match bytes.
-                # Track each sub's outcome separately so "already applied" is not
-                # conflated with "anchor/bytes not found" (the latter means the
-                # patch cannot apply to this binary, e.g. wrong arch).
+                # instr_replace dry-run: use the SAME atomic classifier the apply
+                # path uses, so a partial multi-site match reports the all-or-
+                # nothing abort the real apply will take (not a misleading "would
+                # apply"), and aborts/skips are surfaced as skip, not ok.
                 if p.get("type") == "instr_replace":
                     raw = bytes(data_full)
-                    already_n = 0   # marker matched — patch is live
-                    nomatch_n = 0   # anchor missing or bytes differ — cannot apply
-                    for sub in p.get("patches", []):
-                        anchor = sub.get("anchor", "").encode("utf-8", "surrogateescape")
-                        ofs    = int(sub.get("offset_from_anchor", 0))
-                        mbx    = sub.get("match_bytes_hex", "")
-                        amk    = sub.get("applied_marker_hex")
-                        if not (anchor and mbx):
-                            nomatch_n += 1
-                            continue
-                        ap = raw.find(anchor)
-                        if ap < 0:
-                            nomatch_n += 1
-                            continue
-                        target_off = ap + ofs
-                        if target_off < 0 or target_off + len(mbx) // 2 > len(raw):
-                            nomatch_n += 1
-                            continue
-                        actual = raw[target_off: target_off + len(mbx) // 2]
-                        try:
-                            expected = bytes.fromhex(mbx)
-                            marker_bytes = bytes.fromhex(amk) if amk else None
-                        except ValueError:
-                            nomatch_n += 1
-                            continue
-                        if marker_bytes and actual == marker_bytes:
-                            already_n += 1
-                            continue  # already applied
-                        if actual == expected:
-                            applied_n += 1
-                        else:
-                            nomatch_n += 1
-                    if applied_n:
-                        msg = f"would apply {applied_n} instr-replace(s)"
-                    elif already_n and not nomatch_n:
-                        msg = "no-op (already applied)"
-                    elif already_n:
-                        msg = f"{already_n} already applied, {nomatch_n} not matched (wrong arch/version?)"
-                    else:
-                        msg = "skip (anchor/bytes not found — not applicable to this binary)"
-                    print(f"  {G}ok{X}    {p.get('id','?'):40s}  {msg}")
-                    ok += 1
+                    kind, msg = _instr_verdict(_classify_instr_sites(raw, p.get("patches", [])))
+                    if kind in ("apply", "already"):
+                        print(f"  {G}ok{X}    {p.get('id','?'):40s}  {msg}")
+                        ok += 1
+                    else:  # abort or skip — not applied; surface as skip
+                        print(f"  {Y}skip{X} {p.get('id','?'):40s}  {msg}")
+                        skip += 1
                     continue
 
                 for sub in p.get("patches", []):
@@ -1236,10 +1238,19 @@ def cmd_patch(args) -> int:
                 fail += len(applicable)
             else:
                 for pr in result.get("per_patch", []):
-                    n   = pr["applied"]
-                    msg = "no-op (already applied)" if n == 0 else f"{n} in-place replacement(s)"
-                    print(f"  {G}ok{X}    {pr['id']:40s}  {msg}")
-                    ok += 1
+                    n      = pr["applied"]
+                    reason = pr.get("reason")
+                    if reason:
+                        # An atomic abort or arch mismatch wrote nothing — surface
+                        # it as a skip with the reason, never as "already applied".
+                        print(f"  {Y}skip{X} {pr['id']:40s}  {reason}")
+                        skip += 1
+                    elif n == 0:
+                        print(f"  {G}ok{X}    {pr['id']:40s}  no-op (already applied)")
+                        ok += 1
+                    else:
+                        print(f"  {G}ok{X}    {pr['id']:40s}  {n} in-place replacement(s)")
+                        ok += 1
                 if not result.get("noop") and _can_run_native(fmt, bytes(data_full[:0x40])):
                     print(f"  {G}verified in-place{X}  (ran binary --version, output confirmed)")
                 elif not result.get("noop"):
@@ -1834,12 +1845,10 @@ def cmd_install_config(args) -> int:
     added: list[str] = []
     MARKER = "# ccp: bypass defaults"
 
-    if MARKER in existing_text:
-        print(f"  {G}no-op{X}  ccp defaults already in config.toml")
-        return 0
-
-    # Only count a key as already-set when it is TOP-LEVEL; a nested key under a
-    # [table] does not satisfy a top-level default (see _toml_top_level_text).
+    # Do NOT short-circuit on the marker alone. An old or broken install can carry
+    # the marker while its keys are obsolete or nested under a [table], leaving the
+    # bypass inactive with no repair path. Decide purely on whether each required
+    # key is present TOP-LEVEL; a nested same-named key does not count.
     top_level = _toml_top_level_text(existing_text)
     # Parse key=value lines from template, skip section headers and comments
     for line in template.splitlines():
@@ -1858,10 +1867,15 @@ def cmd_install_config(args) -> int:
         print(f"  {G}no-op{X}  all keys already present")
         return 0
 
-    block = f"{MARKER}\n" + "\n".join(added) + "\n"
+    # Only emit the marker comment if the file does not already carry one (an old
+    # install being repaired keeps its existing marker; we just add the missing
+    # top-level keys).
+    marker_line = "" if MARKER in existing_text else f"{MARKER}\n"
+    block = marker_line + "\n".join(added) + "\n"
     new_text = _insert_top_level_toml(existing_text, block)
     config_path.write_text(new_text, encoding="utf-8")
-    print(f"  {G}{CHECK}{X} {len(added)} key(s) added to {config_path}")
+    note = " (repaired existing install)" if MARKER in existing_text else ""
+    print(f"  {G}{CHECK}{X} {len(added)} key(s) added to {config_path}{note}")
     print(f"\n{G}{CHECK} config installed{X}")
     return 0
 
