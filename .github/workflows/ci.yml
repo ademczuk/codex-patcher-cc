@@ -68,5 +68,5 @@ jobs:
           python -m ccp list
       - name: Run pytest
         run: |
-          python -m pip install pytest --quiet
+          python -m pip install pytest "tomli; python_version < '3.11'" --quiet
           python -m pytest tests/ -v

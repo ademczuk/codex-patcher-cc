@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import json
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11 (project supports >=3.9)
+    import tomli as tomllib
 
 from ccp.__main__ import (
     _insert_top_level_toml,
